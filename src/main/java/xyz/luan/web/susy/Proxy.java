@@ -1,67 +1,76 @@
 package xyz.luan.web.susy;
 
+import com.google.appengine.tools.cloudstorage.*;
+
 import javax.servlet.http.HttpServlet;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
-import java.io.BufferedReader;
 import java.io.IOException;
-import java.io.InputStreamReader;
+import java.io.InputStream;
 import java.net.URL;
 import java.net.URLConnection;
-import java.util.HashMap;
-import java.util.Map;
+import java.nio.channels.Channels;
+
+import static com.google.common.io.ByteStreams.copy;
 
 public class Proxy extends HttpServlet {
 
     private static final String SUZY = "https://susy.ic.unicamp.br:9999";
-
-    private static final Map<String, Request> results = new HashMap<>();
+    private static final String BUCKET = "susy-proxy.appspot.com";
 
     private static class Request {
-        String data, contentType;
+        String contentType;
+        InputStream is;
 
-        public Request(URLConnection c) {
-            this.data = readAll(c);
+        public Request(URLConnection c) throws IOException {
+            this.is = c.getInputStream();
             this.contentType = c.getHeaderField("Content-Type");
+        }
+
+        public Request(InputStream is, String contentType) {
+            this.is = is;
+            this.contentType = contentType;
         }
 
         public void response(HttpServletResponse resp) throws IOException {
             resp.setContentType(contentType);
-            resp.getWriter().println(data);
+            copy(is, resp.getOutputStream());
         }
     }
 
     @Override
     public void doGet(HttpServletRequest request, HttpServletResponse response) throws IOException {
         String path = SUZY + request.getRequestURI() + (request.getQueryString() == null ? "" : "?" + request.getQueryString());
-        Request req = getRequest(path);
-        req.response(response);
+        req(path).response(response);
     }
 
-    private Request getRequest(String path) throws IOException {
-        if (results.containsKey(path)) {
-            return results.get(path);
+    private URLConnection getUrlConnection(String path) throws IOException {
+        URLConnection url = new URL(path).openConnection();
+        url.setConnectTimeout(30000);
+        return url;
+    }
+
+    private Request req(String path) throws IOException {
+        GcsFilename fileName = new GcsFilename(BUCKET, path);
+        GcsService gcsService = GcsServiceFactory.createGcsService();
+        GcsFileMetadata metadata = gcsService.getMetadata(fileName);
+
+        if (metadata == null) {
+            Request req = new Request(getUrlConnection(path));
+            writeFile(fileName, gcsService, req);
+            return req;
+        } else {
+            GcsInputChannel inputChannel = gcsService.openReadChannel(fileName, 0);
+            return new Request(Channels.newInputStream(inputChannel), metadata.getOptions().getMimeType());
         }
-        return fetchRequest(path);
     }
 
-    private Request fetchRequest(String path) throws IOException {
-        URL url = new URL(path);
-        URLConnection urlConnection = url.openConnection();
-        urlConnection.setConnectTimeout(30000);
-        return new Request(urlConnection);
-    }
-
-    private static String readAll(URLConnection urlConnection) {
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(urlConnection.getInputStream(), "UTF-8"))) {
-            String lines = "", line;
-
-            while ((line = reader.readLine()) != null) {
-                lines += line + "\n";
-            }
-            return lines;
-        } catch (IOException ex) {
-            throw new RuntimeException(ex);
-        }
+    private void writeFile(GcsFilename fileName, GcsService gcsService, Request req) throws IOException {
+        GcsFileOptions options = new GcsFileOptions.Builder().mimeType(req.contentType).build();
+        GcsOutputChannel outputChannel = gcsService.createOrReplace(fileName, options);
+        copy(req.is, Channels.newOutputStream(outputChannel));
+        req.is.reset();
+        outputChannel.close();
     }
 }
+
